@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+
+# Backend
+backend/recordings/*
+!backend/recordings/.gitkeep
+backend/chroma_db/
+*.db
+*.sqlite
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/build/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment variables
+.env
+.env.local
+
+# Video files (large)
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# But keep test videos if needed
+!tesvi.mp4
+!shop1.mp4
+
