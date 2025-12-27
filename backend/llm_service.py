@@ -90,8 +90,10 @@ class LLMService:
             
             relevant_clips.append({
                 "video_path": video_path,
+                "video_file": video_filename,  # Include filename for frontend
                 "start_time": start_time,
                 "end_time": end_time,
+                "time_interval": f"{start_time} to {end_time}",  # Include formatted interval for frontend
                 "analysis": analysis_text
             })
         
@@ -205,21 +207,38 @@ Be strict in your correlation assessment. Only include clips with genuine releva
                                         break
                                 
                                 if matching_clip:
+                                    # Ensure video_file and time_interval are included
+                                    parsed_clip = {
+                                        "video_path": matching_clip["video_path"],
+                                        "video_file": matching_clip.get("video_file", re.split(r'[/\\]', matching_clip["video_path"])[-1]),
+                                        "start_time": matching_clip["start_time"],
+                                        "end_time": matching_clip["end_time"],
+                                        "time_interval": matching_clip.get("time_interval", f"{matching_clip['start_time']} to {matching_clip['end_time']}"),
+                                        "analysis": matching_clip["analysis"]
+                                    }
                                     parsed_timestamps.append({
                                         "start": start,
                                         "end": end,
                                         "video_path": matching_clip["video_path"]
                                     })
-                                    parsed_clips.append(matching_clip)
+                                    parsed_clips.append(parsed_clip)
                                     logger.debug(f"Parsed timestamp: {start} to {end}")
                         except Exception as e:
                             logger.warning(f"Error parsing timestamp line: {line}, {e}")
             
             # If no timestamps were parsed but we have relevant_clips, use all of them
             # (fallback if LLM didn't follow format exactly)
+            # Ensure all clips have video_file and time_interval
             if not parsed_timestamps and relevant_clips:
                 parsed_timestamps = timestamps
-                parsed_clips = relevant_clips
+                # Ensure all clips have required fields for frontend
+                parsed_clips = []
+                for clip in relevant_clips:
+                    if "video_file" not in clip:
+                        clip["video_file"] = re.split(r'[/\\]', clip.get("video_path", ""))[-1] if clip.get("video_path") else "unknown"
+                    if "time_interval" not in clip:
+                        clip["time_interval"] = f"{clip.get('start_time', 'unknown')} to {clip.get('end_time', 'unknown')}"
+                    parsed_clips.append(clip)
             
             # Extract the answer part (before TIMESTAMPS:)
             answer_text = answer.split("TIMESTAMPS:", 1)[0] if "TIMESTAMPS:" in answer.upper() else answer
@@ -227,10 +246,19 @@ Be strict in your correlation assessment. Only include clips with genuine releva
             
             logger.info(f"Generated answer from Qwen2.5-Instruct, found {len(parsed_timestamps)} relevant timestamps")
             
+            # Ensure final clips have required fields
+            final_clips = parsed_clips if parsed_clips else relevant_clips
+            # Add missing fields if any
+            for clip in final_clips:
+                if "video_file" not in clip:
+                    clip["video_file"] = re.split(r'[/\\]', clip.get("video_path", ""))[-1] if clip.get("video_path") else "unknown"
+                if "time_interval" not in clip:
+                    clip["time_interval"] = f"{clip.get('start_time', 'unknown')} to {clip.get('end_time', 'unknown')}"
+            
             return {
                 "answer": answer_text,
                 "timestamps": parsed_timestamps if parsed_timestamps else timestamps,
-                "relevant_clips": parsed_clips if parsed_clips else relevant_clips
+                "relevant_clips": final_clips
             }
             
         except Exception as e:

@@ -243,6 +243,7 @@ async def start_stream(request: StreamStartRequest):
             motion_callback=on_motion_detected,
             progress_callback=on_progress_update
         )
+        
         response = {"status": "started"}
         if request.camera_index is not None:
             response["camera_index"] = request.camera_index
@@ -269,25 +270,6 @@ async def get_stream_status():
     
     status = camera_service.get_status()
     return StreamStatus(**status)
-
-@app.get("/api/stream/video")
-async def video_stream():
-    """MJPEG video stream endpoint"""
-    if not camera_service:
-        raise HTTPException(status_code=503, detail="Camera service not initialized")
-    
-    async def generate_frames():
-        while camera_service.is_streaming:
-            frame_bytes = camera_service.get_latest_frame()
-            if frame_bytes:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-            await asyncio.sleep(0.033)  # ~30 FPS
-    
-    return StreamingResponse(
-        generate_frames(),
-        media_type="multipart/x-mixed-replace; boundary=frame"
-    )
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):

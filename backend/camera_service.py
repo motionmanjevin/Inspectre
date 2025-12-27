@@ -38,7 +38,7 @@ class CameraService:
         
         self.recording_writer: Optional[cv2.VideoWriter] = None
         self.recording_start_time: Optional[float] = None
-        self.recording_duration = 16.0  # Maximum recording duration (16 seconds), but can stop earlier if motion stops
+        self.recording_duration = 16.0  # 16 seconds
         self.current_recording_path: Optional[str] = None
         
         self.last_frame: Optional[np.ndarray] = None
@@ -253,21 +253,14 @@ class CameraService:
             # Check if motion detected
             motion_detected = motion_pixels > self.motion_threshold
             
-            # Update motion state and notify callback
             if motion_detected != self.motion_detected:
                 self.motion_detected = motion_detected
                 if self.motion_callback:
                     self.motion_callback(motion_detected)
             
-            # Start recording when motion is detected and not already recording
+            # If motion detected and not recording, start recording
             if motion_detected and not self.is_recording:
-                logger.info(f"Motion detected - starting recording. Motion pixels: {motion_pixels}")
                 self._start_recording()
-            
-            # Stop recording immediately when motion stops (don't wait for timer)
-            if not motion_detected and self.is_recording:
-                logger.info("Motion stopped - stopping recording early")
-                self._stop_recording()
             
             # Update last frame
             self.last_frame = gray_current
@@ -332,13 +325,11 @@ class CameraService:
         logger.info(f"Recordings directory: {self.recordings_dir}")
     
     def _recording_timer(self):
-        """Timer for maximum recording duration (stops after 16 seconds if motion is still present)"""
+        """Timer for 16-second recording duration"""
         while self.is_recording and (time.time() - self.recording_start_time) < self.recording_duration:
             time.sleep(0.5)
         
-        # Only stop if still recording (motion might have stopped earlier, which would have stopped recording)
         if self.is_recording:
-            logger.info("Maximum recording duration reached - stopping recording")
             self._stop_recording()
     
     def _stop_recording(self):
