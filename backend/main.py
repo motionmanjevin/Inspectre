@@ -299,8 +299,11 @@ async def get_progress():
 
 @app.get("/api/video/{video_filename:path}")
 async def get_video(video_filename: str):
-    """Serve video files"""
+    """Serve video files - converts AVI to MP4 for better streaming compatibility"""
     import os
+    import subprocess
+    import shutil
+    
     # Security: Only allow files from recordings directory
     # Use the camera service's recordings directory if available, otherwise check common locations
     base_dir = None
@@ -338,25 +341,79 @@ async def get_video(video_filename: str):
         logger.error(f"Video file not found: {video_path}")
         raise HTTPException(status_code=404, detail=f"Video not found: {video_filename}")
     
-    # Log video serving for debugging
-    logger.info(f"Serving video file: {video_path} (size: {video_path.stat().st_size} bytes)")
-    
-    # Determine content type based on file extension
+    # For AVI files, convert to MP4 for better HTTP streaming compatibility
+    serve_path = video_path
     content_type = "video/mp4"
+    final_filename = video_filename
+    
     if video_filename.lower().endswith('.avi'):
-        content_type = "video/x-msvideo"
-    elif video_filename.lower().endswith('.mov'):
-        content_type = "video/quicktime"
-    elif video_filename.lower().endswith('.webm'):
-        content_type = "video/webm"
+        # Create converted MP4 path
+        mp4_filename = video_filename.replace('.avi', '.mp4')
+        mp4_path = base_dir / mp4_filename
+        
+        # Convert if MP4 doesn't exist or is older than AVI
+        if not mp4_path.exists() or mp4_path.stat().st_mtime < video_path.stat().st_mtime:
+            logger.info(f"Converting AVI to MP4: {video_filename} -> {mp4_filename}")
+            try:
+                # Check if ffmpeg is available
+                ffmpeg_cmd = shutil.which('ffmpeg')
+                if not ffmpeg_cmd:
+                    logger.warning("ffmpeg not found, serving AVI directly (may have streaming issues)")
+                else:
+                    # Convert AVI to MP4 using ffmpeg
+                    cmd = [
+                        ffmpeg_cmd,
+                        '-i', str(video_path),
+                        '-c:v', 'libx264',  # H.264 codec
+                        '-c:a', 'aac',      # AAC audio (if audio exists)
+                        '-movflags', '+faststart',  # Enable fast start for HTTP streaming
+                        '-preset', 'ultrafast',     # Fast conversion
+                        '-y',                # Overwrite output
+                        str(mp4_path)
+                    ]
+                    
+                    result = subprocess.run(
+                        cmd,
+                        capture_output=True,
+                        text=True,
+                        timeout=30  # 30 second timeout
+                    )
+                    
+                    if result.returncode == 0 and mp4_path.exists():
+                        logger.info(f"Successfully converted {video_filename} to MP4")
+                        serve_path = mp4_path
+                        final_filename = mp4_filename
+                    else:
+                        logger.error(f"FFmpeg conversion failed: {result.stderr}")
+                        logger.warning("Serving AVI directly (may have streaming issues)")
+            except subprocess.TimeoutExpired:
+                logger.error(f"FFmpeg conversion timed out for {video_filename}")
+            except Exception as e:
+                logger.error(f"Error converting AVI to MP4: {e}")
+        else:
+            # MP4 already exists and is up to date
+            serve_path = mp4_path
+            final_filename = mp4_filename
+            logger.info(f"Using existing MP4 conversion: {mp4_filename}")
+    else:
+        # For non-AVI files, determine content type
+        if video_filename.lower().endswith('.mov'):
+            content_type = "video/quicktime"
+        elif video_filename.lower().endswith('.webm'):
+            content_type = "video/webm"
+        elif video_filename.lower().endswith('.mp4'):
+            content_type = "video/mp4"
+    
+    # Log video serving for debugging
+    logger.info(f"Serving video file: {serve_path} (size: {serve_path.stat().st_size} bytes)")
     
     return FileResponse(
-        path=str(video_path),
+        path=str(serve_path),
         media_type=content_type,
-        filename=video_filename,
+        filename=final_filename,
         headers={
             "Accept-Ranges": "bytes",
-            "Content-Disposition": f'inline; filename="{video_filename}"'
+            "Content-Disposition": f'inline; filename="{final_filename}"'
         }
     )
 
