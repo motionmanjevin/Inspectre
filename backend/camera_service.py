@@ -40,6 +40,7 @@ class CameraService:
         self.recording_start_time: Optional[float] = None
         self.recording_duration = 16.0  # 16 seconds
         self.current_recording_path: Optional[str] = None
+        self.recording_lock = threading.Lock()  # Lock to prevent race conditions
         
         self.last_frame: Optional[np.ndarray] = None
         self.processed_clips = []
@@ -153,15 +154,31 @@ class CameraService:
     
     def stop_stream(self):
         """Stop streaming and recording"""
+        logger.info("Stopping stream...")
         self.is_streaming = False
-        self.is_recording = False
         
-        if self.recording_writer is not None:
-            self.recording_writer.release()
-            self.recording_writer = None
+        # Stop any active recording properly
+        if self.is_recording:
+            try:
+                self._stop_recording()
+            except Exception as e:
+                logger.error(f"Error stopping recording during stream stop: {e}")
+                # Force cleanup if _stop_recording fails
+                with self.recording_lock:
+                    self.is_recording = False
+                if self.recording_writer is not None:
+                    try:
+                        self.recording_writer.release()
+                    except:
+                        pass
+                    self.recording_writer = None
         
+        # Release camera
         if self.cap is not None:
-            self.cap.release()
+            try:
+                self.cap.release()
+            except Exception as e:
+                logger.error(f"Error releasing camera: {e}")
             self.cap = None
         
         # Wait for threads to finish
@@ -169,7 +186,7 @@ class CameraService:
             self.stream_thread.join(timeout=2.0)
         if self.motion_thread and self.motion_thread.is_alive():
             self.motion_thread.join(timeout=2.0)
-        if self.recording_thread and self.recording_thread.is_alive():
+        if hasattr(self, 'recording_thread') and self.recording_thread and self.recording_thread.is_alive():
             self.recording_thread.join(timeout=2.0)
         
         logger.info("Stopped streaming")
@@ -192,13 +209,28 @@ class CameraService:
                     if self.is_recording and self.recording_writer is not None:
                         try:
                             self.recording_writer.write(frame)
-                        except Exception as e:
-                            logger.error(f"Error writing frame to video: {e}")
+                        except (cv2.error, Exception) as e:
+                            error_msg = str(e)
+                            # Check if it's the FFmpeg threading assertion error
+                            if "async_lock" in error_msg or "Assertion" in error_msg:
+                                logger.error(f"FFmpeg threading error (async_lock assertion): {error_msg}")
+                                logger.warning("This is usually caused by race conditions - stopping current recording")
+                            else:
+                                logger.error(f"Error writing frame to video: {e}")
+                            
                             # Stop recording if we can't write frames
-                            self.is_recording = False
-                            if self.recording_writer is not None:
-                                self.recording_writer.release()
+                            try:
+                                if self.recording_writer is not None:
+                                    self.recording_writer.release()
+                            except:
+                                pass
+                            finally:
                                 self.recording_writer = None
+                            
+                            with self.recording_lock:
+                                self.is_recording = False
+                            
+                            logger.info("Recording stopped due to write error - will attempt to restart on next motion")
                 else:
                     consecutive_errors += 1
                     if consecutive_errors >= max_consecutive_errors:
@@ -223,6 +255,12 @@ class CameraService:
         # Clean up if loop exits due to errors
         if self.is_streaming:
             logger.warning("Stream loop exited unexpectedly. Cleaning up.")
+            # Stop any active recording
+            if self.is_recording:
+                try:
+                    self._stop_recording()
+                except Exception as e:
+                    logger.error(f"Error stopping recording during cleanup: {e}")
             self.is_streaming = False
     
     def _motion_detection_loop(self):
@@ -267,25 +305,35 @@ class CameraService:
     
     def _start_recording(self):
         """Start recording a 16-second clip"""
-        if self.is_recording:
-            return
+        with self.recording_lock:
+            if self.is_recording:
+                return
+            
+            # Wait for any previous recording thread to finish
+            if hasattr(self, 'recording_thread') and self.recording_thread is not None:
+                if self.recording_thread.is_alive():
+                    logger.debug("Waiting for previous recording thread to finish...")
+                    self.recording_thread.join(timeout=1.0)
+            
+            self.is_recording = True
         
-        self.is_recording = True
+        # Release lock before file operations
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.current_recording_path = str(self.recordings_dir / f"clip_{timestamp}.mp4")
+        self.current_recording_path = str(self.recordings_dir / f"clip_{timestamp}.avi")
         
         # Get frame dimensions
         ret, frame = self.cap.read()
         if not ret:
-            self.is_recording = False
+            with self.recording_lock:
+                self.is_recording = False
             return
         
         height, width = frame.shape[:2]
         fps = int(self.cap.get(cv2.CAP_PROP_FPS)) or 30
         
-        # Initialize video writer
-        # Try H.264 codec first (better browser support), fallback to mp4v
-        fourcc = cv2.VideoWriter_fourcc(*'H264')
+        # Initialize video writer - use AVI format with XVID codec (skip H.264 to avoid errors)
+        fourcc = cv2.VideoWriter_fourcc(*'XVID')
+        successful_codec = 'XVID'
         self.recording_writer = cv2.VideoWriter(
             self.current_recording_path,
             fourcc,
@@ -293,10 +341,11 @@ class CameraService:
             (width, height)
         )
         
-        # If H.264 fails, try mp4v
+        # If XVID fails, try MJPG as fallback (works with AVI)
         if not self.recording_writer.isOpened():
-            logger.warning("H.264 codec not available, trying mp4v")
-            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            logger.warning("XVID codec failed, trying MJPG")
+            fourcc = cv2.VideoWriter_fourcc(*'MJPG')
+            successful_codec = 'MJPG'
             self.recording_writer = cv2.VideoWriter(
                 self.current_recording_path,
                 fourcc,
@@ -304,17 +353,26 @@ class CameraService:
                 (width, height)
             )
         
+        # Verify writer is working
         if not self.recording_writer.isOpened():
-            logger.error(f"Failed to open video writer with codec")
-            self.is_recording = False
+            logger.error("Failed to open video writer with XVID or MJPG codec")
+            logger.error("Recording aborted - no valid video codec available")
+            with self.recording_lock:
+                self.is_recording = False
+            self.current_recording_path = None
+            self.recording_start_time = None
             return
         
-        self.recording_start_time = time.time()
+        logger.info(f"Video writer initialized successfully (format: AVI, codec: {successful_codec})")
+        
+        with self.recording_lock:
+            self.recording_start_time = time.time()
         
         # Verify the directory exists and is writable
         if not self.recordings_dir.exists():
             logger.error(f"Recordings directory does not exist: {self.recordings_dir}")
-            self.is_recording = False
+            with self.recording_lock:
+                self.is_recording = False
             return
         
         # Start recording thread
@@ -322,7 +380,6 @@ class CameraService:
         self.recording_thread.start()
         
         logger.info(f"Started recording to: {self.current_recording_path}")
-        logger.info(f"Recordings directory: {self.recordings_dir}")
     
     def _recording_timer(self):
         """Timer for 16-second recording duration"""
@@ -331,61 +388,80 @@ class CameraService:
         
         if self.is_recording:
             self._stop_recording()
+            # Small delay to allow file system and FFmpeg to fully release resources
+            time.sleep(0.2)
     
     def _stop_recording(self):
         """Stop recording and save clip"""
-        if not self.is_recording:
-            return
+        with self.recording_lock:
+            if not self.is_recording:
+                return
+            
+            saved_path = self.current_recording_path
+            self.is_recording = False  # Stop accepting new frames immediately
         
-        self.is_recording = False
+        # Release lock before file operations
         
         if self.recording_writer is not None:
-            self.recording_writer.release()
+            try:
+                self.recording_writer.release()
+            except Exception as e:
+                logger.error(f"Error releasing video writer: {e}")
             self.recording_writer = None
         
-        if self.current_recording_path:
-            # Give the file system a moment to finish writing
-            time.sleep(0.5)
+        if saved_path:
+            # Give AVI files more time to finalize (they take longer than MP4)
+            time.sleep(1.0)  # Increased from 0.5 to 1.0 seconds
             
-            # Verify file was actually created and has content
-            video_path = Path(self.current_recording_path)
+            video_path = Path(saved_path)
             
-            # Wait a bit more if file doesn't exist yet (up to 2 seconds)
-            retries = 4
-            while retries > 0 and not video_path.exists():
-                time.sleep(0.5)
-                retries -= 1
+            # Wait for file to exist and check size multiple times
+            # AVI files can take time to be fully written
+            max_retries = 10
+            retries = 0
+            file_size = 0
             
-            if video_path.exists():
-                file_size = video_path.stat().st_size
-                if file_size > 0:
-                    self.processed_clips.append(self.current_recording_path)
-                    logger.info(f"Stopped recording: {self.current_recording_path} (size: {file_size} bytes)")
-                    
-                    # Notify that a new clip is ready for processing
-                    if self.progress_callback:
-                        self.progress_callback("clip_ready", self.current_recording_path)
-                else:
-                    logger.warning(f"Recording file exists but is empty: {self.current_recording_path}")
-                    # Try to delete empty file
+            while retries < max_retries:
+                if video_path.exists():
                     try:
-                        video_path.unlink()
-                    except:
-                        pass
-            else:
-                logger.error(f"Recording file was not created: {self.current_recording_path}")
-                logger.error(f"Expected directory: {self.recordings_dir}")
-                logger.error(f"Directory exists: {self.recordings_dir.exists()}")
-                logger.error(f"Directory is writable: {os.access(self.recordings_dir, os.W_OK) if self.recordings_dir.exists() else False}")
-                if self.recordings_dir.exists():
-                    try:
-                        contents = list(self.recordings_dir.iterdir())
-                        logger.error(f"Directory contents ({len(contents)} items): {[str(c.name) for c in contents[:5]]}")
+                        file_size = video_path.stat().st_size
+                        # AVI files should be at least a few KB (header + some frames)
+                        # Check for reasonable minimum size (at least 1KB instead of just > 0)
+                        if file_size > 1024:  # Changed from > 0 to > 1024 bytes (1KB)
+                            break
                     except Exception as e:
-                        logger.error(f"Error listing directory contents: {e}")
+                        logger.warning(f"Error checking file size (attempt {retries+1}): {e}")
+                retries += 1
+                time.sleep(0.3)  # Wait 0.3 seconds between checks
+            
+            if video_path.exists() and file_size > 1024:
+                self.processed_clips.append(saved_path)
+                logger.info(f"Stopped recording: {saved_path} (size: {file_size} bytes)")
+                
+                # Notify that a new clip is ready for processing
+                if self.progress_callback:
+                    try:
+                        self.progress_callback("clip_ready", saved_path)
+                        logger.info(f"Callback triggered for clip: {saved_path}")
+                    except Exception as e:
+                        logger.error(f"Error calling progress callback: {e}")
+            else:
+                if video_path.exists():
+                    logger.warning(f"Recording file too small ({file_size} bytes), deleting: {saved_path}")
+                else:
+                    logger.error(f"Recording file not found after {max_retries} retries: {saved_path}")
+                
+                # Try to delete empty/invalid file
+                try:
+                    if video_path.exists():
+                        video_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Could not delete invalid file: {e}")
         
-        self.current_recording_path = None
-        self.recording_start_time = None
+        # Clear state with lock
+        with self.recording_lock:
+            self.current_recording_path = None
+            self.recording_start_time = None
     
     def get_latest_frame(self) -> Optional[bytes]:
         """Get latest frame as JPEG for MJPEG stream"""
